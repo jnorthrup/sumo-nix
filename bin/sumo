@@ -1,0 +1,858 @@
+#!/usr/bin/env bash
+# sumo — the command the user reaches for in the VM.
+# Pure bash + nix eval (the two stores from tools/env.sh), on PATH in the VM.
+# All evaluation flows through bin/_sumo.nix, a read-only dispatcher that returns the digest as an attrset.
+# Local API sketch: s cmd [status], s topology, s proof [goal].
+
+set -euo pipefail
+
+# Source shared environment (NIX_STORE_DIR, NIX_STATE_DIR)
+source "$(dirname "$0")/../tools/env.sh"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Default fact/rules/policies locations
+SUMO_FACTS="${SUMO_FACTS:-/run/sumo/facts.kif}"
+SUMO_RULES="${SUMO_RULES:-/run/sumo/rules.kif}"
+SUMO_POLICIES="${SUMO_POLICIES:-${ROOT}/policies.kif}"
+
+# If the default facts file doesn't exist, fall back to in-repo curated facts
+if [ ! -f "$SUMO_FACTS" ]; then
+  SUMO_FACTS="${ROOT}/demo/facts/host.kif"
+fi
+
+# If rules file doesn't exist or is empty/placeholder, fall back to root rules.kif
+if [ ! -f "$SUMO_RULES" ] || [ ! -s "$SUMO_RULES" ]; then
+  SUMO_RULES="${ROOT}/rules.kif"
+fi
+
+# If policies file doesn't exist, don't pass it (dispatcher will use default)
+if [ ! -f "$SUMO_POLICIES" ] || [ ! -s "$SUMO_POLICIES" ]; then
+  SUMO_POLICIES=""
+fi
+
+# M3A — metavisor source-labeled drift. Prefer an explicit path, then the
+# NixOS module's files, then the repo's local runtime directory.
+SUMO_DECLARED="${SUMO_DECLARED:-}"
+SUMO_OBSERVED="${SUMO_OBSERVED:-}"
+if [ -z "$SUMO_DECLARED" ]; then
+  for p in /etc/sumo/declared.kif "${ROOT}/.runtime/declared.kif"; do
+    if [ -f "$p" ]; then SUMO_DECLARED="$p"; break; fi
+  done
+fi
+if [ -z "$SUMO_OBSERVED" ]; then
+  for p in /run/sumo/observed.kif "${ROOT}/.runtime/observed.kif"; do
+    if [ -f "$p" ]; then SUMO_OBSERVED="$p"; break; fi
+  done
+fi
+
+# Build the dispatcher with the current fact/rules/policies paths
+DISPATCHER="${ROOT}/bin/_sumo.nix"
+METAVISOR="${ROOT}/bin/_metavisor.nix"
+
+# Convert path to absolute (does not require the target to exist).
+abs_path() {
+  local p="$1"
+  if [[ "$p" = /* ]]; then
+    realpath -ms "$p"
+  else
+    realpath -ms "$(pwd)/$p"
+  fi
+}
+
+# Quote a value as a Nix string literal.
+nix_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+default_configuration() {
+  if [ -f /etc/nixos/configuration.nix ]; then
+    echo /etc/nixos/configuration.nix
+  elif [ -f ./configuration.nix ]; then
+    abs_path ./configuration.nix
+  else
+    echo ""
+  fi
+}
+
+# Build common dispatcher args
+dispatcher_args() {
+  local json_flag="${1:-false}"
+  local facts_abs=$(abs_path "$SUMO_FACTS")
+  local rules_abs=$(abs_path "$SUMO_RULES")
+  local args="facts = \"${facts_abs}\"; rules = \"${rules_abs}\"; json = ${json_flag}"
+  if [ -n "$SUMO_POLICIES" ]; then
+    local policies_abs=$(abs_path "$SUMO_POLICIES")
+    args="${args}; policies = \"${policies_abs}\""
+  fi
+  if [ -n "$SUMO_DECLARED" ] && [ -f "$SUMO_DECLARED" ]; then
+    local declared_abs observed_abs
+    declared_abs=$(abs_path "$SUMO_DECLARED")
+    observed_abs=""
+    if [ -n "$SUMO_OBSERVED" ]; then observed_abs=$(abs_path "$SUMO_OBSERVED"); fi
+    args="${args}; metavisor = { declared = \"${declared_abs}\"; observed = \"${observed_abs}\"; }"
+  fi
+  echo "(import ${DISPATCHER} { ${args}; })"
+}
+
+usage() {
+  cat <<'EOF'
+sumo — reason about this machine
+
+Usage: sumo <command> [args...]
+
+Commands:
+  status [--json]         Machine overview: services, packages, capabilities, rounds; verdict + proof file
+  caps [--json]           Capability atlas of the installed closure
+  closure <pkg> [--json]  Dependency tree (indented)
+  query <goal> [--json]   Ground goal → verdict + why subtree
+  ask <pattern> [--json]  Non-ground query → all bindings (e.g., '(vulnerable ?pkg ?cve)')
+  why <goal> [--json]     Proof tree for a ground goal
+  proof <goal> [--json]   Export proof as KIF certificate (for 'sumo check')
+  check <file.kif>        Independent re-checker for a proof certificate
+  relax [--json]          Relaxation menu: which single fact/rule flip changes the verdict
+  whatif [--json]         One counterfactual from the proof: two warm runs, exit 1 when a flip
+  dashboard               Build and run the TUI over the digest (no TTY needed for --dump)
+  refresh                 Re-collect live facts (sumo-facts on NixOS, demo/host-facts.sh elsewhere)
+  guard [--json]          Policy check: exits 1 on violation, 0 when clean
+  lift [--configuration FILE] [--json]
+                          Lift a NixOS config to declared facts (option-path provenance)
+  drift [--declared FILE --observed FILE] [--now N] [--json|--journal]
+                          Source-labeled drift/rogue report (exits 1 on drift/violation)
+  repair [--configuration FILE] [--json]
+                          Ranked single-option repairs, each re-lifted and re-gated
+  gate [--configuration FILE] [--json]
+                          Config gate: exits 1 with the proof when the config violates system.kif
+  init [dir] [--force]    Scaffold a new sumonix project (facts/rules/policies + pre-commit + CI)
+  lint [file...]          Lint KIF files: file:line:col diagnostics, typo suggestions
+  version                 Show version
+  --help                  Show this help
+
+Environment:
+  SUMO_FACTS    Path to facts KIF (default: /run/sumo/facts.kif, then demo/facts/host.kif)
+  SUMO_RULES    Path to rules KIF (default: /run/sumo/rules.kif, then rules.kif)
+  SUMO_POLICIES Path to policies KIF (default: ./policies.kif, then none)
+  SUMO_DECLARED Path to lifted declared facts (default: /etc/sumo/declared.kif)
+  SUMO_OBSERVED Path to observer output (default: /run/sumo/observed.kif)
+  SUMO_CACHE_DIR Evaluation cache root (default: .runtime/cache)
+  SUMO_NO_CACHE  1 to bypass the cache (same as --no-cache)
+
+Examples:
+  sumo status
+  sumo status --json
+  sumo caps
+  sumo closure openssl
+  sumo closure openssl --json
+  sumo query '(vulnerable nginx CVE-2026-9999)'
+  sumo ask '(vulnerable ?pkg ?cve)'
+  sumo why '(policyViolation nginx NoCriticalRunningCVE)'
+  sumo proof '(policyViolation nginx NoCriticalRunningCVE)' > proof.kif
+  sumo check proof.kif
+  sumo relax
+  sumo whatif
+  sumo dashboard
+  sumo refresh
+  sumo guard
+  sumo guard --json
+  sumo init my-project
+  sumo init --force
+  sumo lint facts.kif policies.kif
+EOF
+}
+
+version() {
+  echo "sumo 0.1.0 (sumonix)"
+}
+
+run_nix() {
+  "$ROOT/nix-eval.sh" --raw --expr "$1"
+}
+
+# --- M0.1 evaluation cache ---------------------------------------------------
+# Warm subcommands read a checksummed cache instead of re-evaluating. The key is
+# sha256(facts + rules + ontology + synthesized + engine version + engine files),
+# so any input or code change invalidates it. Entries are partitioned by
+# predicate (`.runtime/cache/<digest>/<predicate>/`) and each carries its own
+# checksum: a poisoned entry is reported and recomputed, never served.
+# Commands whose answer depends on the clock (drift, metavisor status) bypass the
+# cache: a cached claim could outlive its attestation (R1).
+ENGINE_VERSION="${SUMONIX_ENGINE_VERSION:-m0.2}"
+CACHE_DIGEST="${_CACHE_DIGEST:-}"
+
+cache_digest() {
+  if [ -n "$CACHE_DIGEST" ]; then
+    printf '%s' "$CACHE_DIGEST"
+    return
+  fi
+  local manifest
+  manifest="$(
+    {
+      printf 'engine %s\n' "$ENGINE_VERSION"
+      printf '%s\n' \
+        "$DISPATCHER" "$METAVISOR" "$ROOT/sumo.nix" "$ROOT/system.kif" \
+        "$ROOT/rules.kif" "$ROOT/nix-domain.kif" "$ROOT/lib/kif.nix" \
+        "$ROOT/lib/kif-diag.nix" "$ROOT/sumo.full/Merge.kif" \
+        "$ROOT"/reasoner/*.nix \
+        "${SUMO_FACTS:-}" "${SUMO_RULES:-}" "${SUMO_POLICIES:-}" \
+        "${SUMO_DECLARED:-}" "${SUMO_OBSERVED:-}" "${SUMO_CONFIG_FILE:-}"
+    } | while IFS= read -r f; do
+      if [ -n "$f" ] && [ -f "$f" ]; then printf '%s\n' "$f"; fi
+    done | LC_ALL=C sort | xargs sha256sum
+  )"
+  CACHE_DIGEST="$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)"
+  printf '%s' "$CACHE_DIGEST"
+}
+
+# run_cached <predicate> <expression>
+run_cached() {
+  local predicate="$1" expr="$2"
+  if [ "${SUMO_NO_CACHE:-0}" = "1" ]; then
+    run_nix "$expr"
+    return $?
+  fi
+  cache_digest > /dev/null
+  local dir key out meta
+  dir="${SUMO_CACHE_DIR:-${ROOT}/.runtime/cache}/${CACHE_DIGEST}/${predicate}"
+  key="$(printf '%s' "$expr" | sha256sum | cut -d' ' -f1)"
+  out="${dir}/${key}.out"
+  meta="${dir}/${key}.meta"
+
+  if [ -f "$out" ] && [ -f "$meta" ]; then
+    local want got code
+    want="$(sed -n 's/^sha256=//p' "$meta")"
+    got="$(sha256sum "$out" | cut -d' ' -f1)"
+    if [ "$want" = "$got" ]; then
+      code="$(sed -n 's/^code=//p' "$meta")"
+      cat "$out"
+      return "${code:-0}"
+    fi
+    printf 'sumo: cache entry %s/%s failed its checksum; recomputing\n' \
+      "$predicate" "${key:0:12}" >&2
+    rm -f "$out" "$meta"
+  fi
+
+  mkdir -p "$dir"
+  local tmp status
+  tmp="$(mktemp "${dir}/.${key}.XXXXXX")"
+  set +e
+  run_nix "$expr" > "$tmp"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    cat "$tmp"
+    rm -f "$tmp"
+    return "$status"
+  fi
+  mv "$tmp" "$out"
+  {
+    printf 'sha256=%s\n' "$(sha256sum "$out" | cut -d' ' -f1)"
+    printf 'code=0\n'
+    printf 'predicate=%s\n' "$predicate"
+    printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'expr=%s\n' "$expr"
+  } > "${meta}.tmp"
+  mv "${meta}.tmp" "$meta"
+  cat "$out"
+}
+
+# Global flags (M0.1): --no-cache bypasses both cache reads and writes.
+args=()
+for arg in "$@"; do
+  if [ "$arg" = "--no-cache" ]; then
+    SUMO_NO_CACHE=1
+  else
+    args+=("$arg")
+  fi
+done
+set -- "${args[@]}"
+
+# Parse subcommand
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  ""|--help|help)
+    usage
+    exit 0
+    ;;
+  version)
+    version
+    exit 0
+    ;;
+  status)
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).status"
+    # A metavisor status depends on the clock (attestation TTL); never cached.
+    if [ -n "$SUMO_DECLARED" ]; then
+      run_nix "$expr"
+    else
+      run_cached status "$expr"
+    fi
+    ;;
+  caps)
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).caps"
+    run_cached caps "$expr"
+    ;;
+  closure)
+    pkg="${1:-}"
+    if [ -z "$pkg" ]; then
+      echo "sumo closure: missing package argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).closure $(nix_quote "$pkg")"
+    run_cached closure "$expr"
+    ;;
+  query)
+    goal="${1:-}"
+    if [ -z "$goal" ]; then
+      echo "sumo query: missing goal argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).query $(nix_quote "$goal")"
+    run_cached query "$expr"
+    ;;
+  ask)
+    pattern="${1:-}"
+    if [ -z "$pattern" ]; then
+      echo "sumo ask: missing pattern argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).ask $(nix_quote "$pattern")"
+    run_cached ask "$expr"
+    ;;
+  why)
+    goal="${1:-}"
+    if [ -z "$goal" ]; then
+      echo "sumo why: missing goal argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).why $(nix_quote "$goal")"
+    if [ -n "$SUMO_DECLARED" ]; then
+      run_nix "$expr"
+    else
+      run_cached why "$expr"
+    fi
+    ;;
+  proof)
+    goal="${1:-}"
+    if [ -z "$goal" ]; then
+      echo "sumo proof: missing goal argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).proofExport $(nix_quote "$goal")"
+    run_cached proof "$expr"
+    ;;
+  check)
+    cert_file="${1:-}"
+    if [ -z "$cert_file" ]; then
+      echo "sumo check: missing certificate file argument" >&2
+      exit 2
+    fi
+    if [ ! -f "$cert_file" ]; then
+      echo "sumo check: file not found: $cert_file" >&2
+      exit 2
+    fi
+    # Convert to absolute path for the Nix evaluator
+    cert_file="$(cd "$(dirname "$cert_file")" && pwd)/$(basename "$cert_file")"
+    expr="(import ${DISPATCHER} { facts = \"${SUMO_FACTS}\"; rules = \"${SUMO_RULES}\"; }).check \"${cert_file}\""
+    run_cached check "$expr"
+    ;;
+  relax)
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).relax"
+    run_cached relax "$expr"
+    ;;
+  whatif)
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).whatif"
+    run_cached whatif "$expr"
+    ;;
+  dashboard)
+    # Resolve TUI binary: PATH → /run/sumo/bin/sumo-tui → repo demo/tui/sumo-tui
+    TUI_BIN=""
+    if command -v sumo-tui >/dev/null 2>&1; then
+      TUI_BIN="$(command -v sumo-tui)"
+    elif [ -x /run/sumo/bin/sumo-tui ]; then
+      TUI_BIN="/run/sumo/bin/sumo-tui"
+    elif [ -x "${ROOT}/demo/tui/sumo-tui" ]; then
+      TUI_BIN="${ROOT}/demo/tui/sumo-tui"
+    else
+      echo "sumo dashboard: TUI binary not found (tried PATH, /run/sumo/bin/sumo-tui, ${ROOT}/demo/tui/sumo-tui)" >&2
+      exit 1
+    fi
+    exec "$TUI_BIN" "$@"
+    ;;
+  refresh)
+    # Re-run the live facts exporter. The NixOS module installs `sumo-facts`;
+    # plain hosts use demo/host-facts.sh and get a separate live file.
+    if command -v sumo-facts >/dev/null 2>&1; then
+      exec sumo-facts
+    elif [ -x /run/sumo/bin/sumo-facts ]; then
+      exec /run/sumo/bin/sumo-facts
+    elif [ -x "${ROOT}/demo/host-facts.sh" ]; then
+      mkdir -p "${ROOT}/.runtime"
+      "${ROOT}/demo/host-facts.sh" > "${ROOT}/.runtime/facts-live.kif"
+      echo "sumo refresh: wrote ${ROOT}/.runtime/facts-live.kif (live host facts)" >&2
+      echo "  read it with: SUMO_FACTS=${ROOT}/.runtime/facts-live.kif sumo status" >&2
+    else
+      echo "sumo refresh: no facts exporter found" >&2
+      exit 1
+    fi
+    ;;
+  pack)
+    action="${1:-}"
+    if [ -z "$action" ]; then
+      echo "sumo pack: missing action (add|list|remove)" >&2
+      exit 2
+    fi
+    shift
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    args_json=$(printf ' %s' "$@" | xargs -I{} echo -n " $(nix_quote "{}")")
+    expr="($(dispatcher_args "${json_flag:-false}")).pack $(nix_quote "$action") [ $args_json ] { json = ${json_flag:-false}; }"
+    run_cached pack "$expr"
+    ;;
+  audit)
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).audit { json = ${json_flag:-false}; }"
+    run_cached audit "$expr"
+    ;;
+  plan)
+    goal="${1:-}"
+    if [ -z "$goal" ]; then
+      echo "sumo plan: missing goal argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).plan { goal = $(nix_quote "$goal"); json = ${json_flag:-false}; }"
+    run_cached plan "$expr"
+    ;;
+  apply)
+    bundleId="${1:-}"
+    if [ -z "$bundleId" ]; then
+      echo "sumo apply: missing bundleId argument" >&2
+      exit 2
+    fi
+    json_flag=""
+    if [ "${2:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).apply { bundleId = $(nix_quote "$bundleId"); json = ${json_flag:-false}; }"
+    run_cached apply "$expr"
+    ;;
+  guard)
+    # Policy check: runs the dispatcher's guard function, exits 1 on any violation
+    json_flag=""
+    if [ "${1:-}" = "--json" ]; then
+      json_flag="true"
+      shift
+    fi
+    expr="($(dispatcher_args "${json_flag:-false}")).guard"
+    result=$(run_cached guard "$expr")
+    if [ "$json_flag" = "true" ]; then
+      echo "$result"
+      # Check if pass is false
+      if echo "$result" | grep -q '"pass":false'; then
+        exit 1
+      fi
+    else
+      echo "$result"
+      # Non-JSON output: check for "violation" or "Policy violation"
+      if echo "$result" | grep -q "violation"; then
+        exit 1
+      fi
+    fi
+    exit 0
+    ;;
+  lift)
+    # sumo lift — lift a NixOS config to declared facts
+    conf=""
+    json_flag="false"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --configuration) conf="${2:-}"; shift 2 ;;
+        --json) json_flag="true"; shift ;;
+        *) echo "sumo lift: unknown argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -z "$conf" ] && conf="$(default_configuration)"
+    if [ -z "$conf" ]; then
+      echo "sumo lift: no configuration found; pass --configuration FILE" >&2
+      exit 2
+    fi
+    if [ ! -f "$conf" ]; then
+      echo "sumo lift: configuration not found: $conf" >&2
+      exit 2
+    fi
+    conf="$(abs_path "$conf")"
+    field="text"
+    [ "$json_flag" = "true" ] && field="json"
+    expr="(import ${METAVISOR} { configuration = $(nix_quote "$conf"); }).lift.${field}"
+    SUMO_CONFIG_FILE="$conf"
+    run_cached lift "$expr"
+    ;;
+  drift)
+    # sumo drift — source-labeled drift/rogue report over declared + observed
+    declared="$SUMO_DECLARED"
+    observed="$SUMO_OBSERVED"
+    now=""
+    mode="text"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --declared) declared="${2:-}"; shift 2 ;;
+        --observed) observed="${2:-}"; shift 2 ;;
+        --now) now="${2:-}"; shift 2 ;;
+        --json) mode="json"; shift ;;
+        --journal) mode="journal"; shift ;;
+        *) echo "sumo drift: unknown argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    if [ -z "$declared" ] || [ ! -f "$declared" ]; then
+      echo "sumo drift: no declared facts; run 'sumo lift' or pass --declared FILE" >&2
+      exit 2
+    fi
+    declared="$(abs_path "$declared")"
+    args="declaredFile = $(nix_quote "$declared")"
+    if [ -n "$observed" ]; then
+      observed="$(abs_path "$observed")"
+      args="$args; observedFile = $(nix_quote "$observed")"
+    fi
+    if [ -n "$now" ]; then
+      if ! [[ "$now" =~ ^[0-9]+$ ]]; then
+        echo "sumo drift: --now must be an integer" >&2
+        exit 2
+      fi
+      args="$args; now = $now"
+    fi
+    field="text"
+    case "$mode" in
+      json) field="json" ;;
+      journal) field="journalText" ;;
+    esac
+    expr="(import ${METAVISOR} { ${args}; }).drift.${field}"
+    result="$(run_nix "$expr")"
+    printf '%s\n' "$result"
+    if [ "$mode" = "json" ]; then
+      if printf '%s' "$result" | grep -q '"status":"\(drift\|violation\)"'; then exit 1; fi
+    else
+      if printf '%s' "$result" | grep -q 'status: \(drift\|violation\)'; then exit 1; fi
+    fi
+    exit 0
+    ;;
+  repair)
+    # sumo repair — ranked single-option repairs, each re-lifted and re-gated
+    conf=""
+    json_flag="false"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --configuration) conf="${2:-}"; shift 2 ;;
+        --json) json_flag="true"; shift ;;
+        *) echo "sumo repair: unknown argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -z "$conf" ] && conf="$(default_configuration)"
+    if [ -z "$conf" ]; then
+      echo "sumo repair: no configuration found; pass --configuration FILE" >&2
+      exit 2
+    fi
+    if [ ! -f "$conf" ]; then
+      echo "sumo repair: configuration not found: $conf" >&2
+      exit 2
+    fi
+    conf="$(abs_path "$conf")"
+    field="text"
+    [ "$json_flag" = "true" ] && field="json"
+    expr="(import ${METAVISOR} { configuration = $(nix_quote "$conf"); }).repairResult.${field}"
+    SUMO_CONFIG_FILE="$conf"
+    run_cached repair "$expr"
+    ;;
+  gate)
+    # sumo gate — lift + system.kif policy gate, exits 1 with the why-tree
+    conf=""
+    json_flag="false"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --configuration) conf="${2:-}"; shift 2 ;;
+        --json) json_flag="true"; shift ;;
+        *) echo "sumo gate: unknown argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -z "$conf" ] && conf="$(default_configuration)"
+    if [ -z "$conf" ]; then
+      echo "sumo gate: no configuration found; pass --configuration FILE" >&2
+      exit 2
+    fi
+    if [ ! -f "$conf" ]; then
+      echo "sumo gate: configuration not found: $conf" >&2
+      exit 2
+    fi
+    conf="$(abs_path "$conf")"
+    field="text"
+    [ "$json_flag" = "true" ] && field="json"
+    expr="(import ${METAVISOR} { configuration = $(nix_quote "$conf"); }).gateResult.${field}"
+    SUMO_CONFIG_FILE="$conf"
+    result="$(run_cached gate "$expr")"
+    printf '%s\n' "$result"
+    if [ "$json_flag" = "true" ]; then
+      if printf '%s' "$result" | grep -q '"pass":false'; then exit 1; fi
+    else
+      if printf '%s' "$result" | grep -q '^gate: violation'; then exit 1; fi
+    fi
+    exit 0
+    ;;
+  init)
+    # sumo init — scaffold a new sumonix project
+    init_dir="${1:-.}"
+    shift || true
+    
+    force=false
+    if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+      force=true
+      shift
+    fi
+    
+    mkdir -p "$init_dir"
+    
+    # Check for existing files
+    for f in facts.kif rules.kif policies.kif .pre-commit-config.yaml .github/workflows/sumonix.yml; do
+      if [ -f "$init_dir/$f" ] && [ "$force" = "false" ]; then
+        echo "sumo init: $init_dir/$f already exists (use --force to overwrite)" >&2
+        exit 1
+      fi
+    done
+    
+    # facts.kif template
+    cat > "$init_dir/facts.kif" <<'FACTS_EOF'
+;; SUMO machine facts — live facts go in the live section, fixture/scenario facts in fixture
+;; Run `sumo refresh` to regenerate live facts from the system
+
+;; source: live
+;; (Live facts are auto-generated by sumo-facts. Add your own below if needed.)
+
+;; source: fixture
+;; Scenario / example facts — replace with your system's actual packages/services
+;; (instance your-pkg NIXPackage)
+;; (instance your-svc NIXService)
+;; (serviceState your-svc running)
+;; (dependsOn your-pkg some-dep)
+FACTS_EOF
+
+    # rules.kif template
+    cat > "$init_dir/rules.kif" <<'RULES_EOF'
+;; SUMO user rules — add custom rules here
+;; The SUMO ontology + NIX domain + built-in rules are loaded automatically.
+;; See rules.kif in the sumonix repo for the core transitive-dep / vulnerable / policy rules.
+
+;; Example custom rule:
+;; (=>
+;;   (and
+;;     (instance ?pkg NIXPackage)
+;;     (license ?pkg "GPL-3.0"))
+;;   (copyleft ?pkg))
+RULES_EOF
+
+    # policies.kif template
+    cat > "$init_dir/policies.kif" <<'POLICIES_EOF'
+;; SUMO policy goals — each (policyGoal <name> <goal-pattern>) declares a goal to check.
+;; The `sumo guard` command evaluates all declared goals and reports every violation with proof.
+;; source: fixture
+
+;; Policy: No service running with a critical CVE in its transitive closure
+(policyGoal NoCriticalRunningCVE (policyViolation ?pkg NoCriticalRunningCVE))
+
+;; Policy: No package with a critical CVE should be in the closure of a running service
+(policyGoal NoCriticalInServiceClosure
+  (and
+    (instance ?pkg NIXPackage)
+    (vulnerable ?pkg ?cve)
+    (severity ?cve critical)
+    (instance ?svc NIXService)
+    (serviceState ?svc running)
+    (dependsOnTransitive ?svc ?pkg)))
+
+;; Example: enforce that all services have a defined owner
+;; (policyGoal ServiceHasOwner
+;;   (and
+;;     (instance ?svc NIXService)
+;;     (not (runningAs ?svc ?user))))
+POLICIES_EOF
+
+    # .pre-commit-config.yaml
+    mkdir -p "$init_dir/.github/workflows"
+    cat > "$init_dir/.pre-commit-config.yaml" <<'PRECOMMIT_EOF'
+# pre-commit hooks for SUMO policy gates
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: sumo-guard
+        name: SUMO policy guard
+        entry: sumo guard --json
+        language: system
+        types: [kif]
+        # Run on facts.kif, rules.kif, policies.kif changes
+        files: '\.(kif)$'
+        # Requires sumo on PATH (from nix develop or nix run github:autonull/sumonix)
+        pass_filenames: false
+        verbose: true
+
+      - id: sumo-lint
+        name: SUMO KIF lint
+        entry: sumo lint
+        language: system
+        types: [kif]
+        files: '\.(kif)$'
+        pass_filenames: true
+        verbose: true
+PRECOMMIT_EOF
+
+    # CI template
+    cat > "$init_dir/.github/workflows/sumonix.yml" <<'CI_EOF'
+name: SUMO Policy Gate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  sumo-guard:
+    name: SUMO Policy Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+
+      - name: Run sumo guard
+        # Uses the published flake: nix run github:autonull/sumonix
+        # Or use the local flake if you want to test local changes:
+        # run: nix run .# -- guard --json
+        run: nix run github:autonull/sumonix -- guard --json
+        env:
+          # Point to your project's fact/rules/policies files
+          SUMO_FACTS: ${{ github.workspace }}/facts.kif
+          SUMO_RULES: ${{ github.workspace }}/rules.kif
+          SUMO_POLICIES: ${{ github.workspace }}/policies.kif
+
+  # Optional: run the full test suite if you depend on sumonix internals
+  # tests:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: DeterminateSystems/nix-installer-action@v12
+  #     - run: nix flake check --all-systems
+CI_EOF
+
+    echo "sumo init: scaffolded $init_dir"
+    echo ""
+    echo "Created:"
+    echo "  $init_dir/facts.kif       — machine facts (live + fixture sections)"
+    echo "  $init_dir/rules.kif       — custom rules"
+    echo "  $init_dir/policies.kif    — policy goals for sumo guard"
+    echo "  $init_dir/.pre-commit-config.yaml  — pre-commit hooks"
+    echo "  $init_dir/.github/workflows/sumonix.yml  — CI policy gate"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Edit facts.kif with your actual packages/services (or run 'sumo refresh' on NixOS)"
+    echo "  2. Edit policies.kif with your compliance requirements"
+    echo "  3. Run 'sumo guard' to check policies"
+    echo "  4. Install pre-commit: pip install pre-commit && pre-commit install"
+    echo "  5. Push to trigger the CI policy gate"
+    ;;
+  lint)
+    # sumo lint — validate KIF syntax using the parser
+    lint_files=("$@")
+    if [ "${#lint_files[@]}" -eq 0 ]; then
+      lint_files=(facts.kif rules.kif policies.kif)
+    fi
+
+    lint_fail=0
+    for f in "${lint_files[@]}"; do
+      if [ ! -f "$f" ]; then
+        printf 'sumo lint: file not found: %s\n' "$f" >&2
+        exit 2
+      fi
+      f_abs=$(abs_path "$f")
+      expr="(import ${DISPATCHER} { facts = \"$f_abs\"; rules = \"${ROOT}/rules.kif\"; }).lint \"$f_abs\""
+      out="$(run_cached lint "$expr")"
+      verdict="$(printf '%s\n' "$out" | head -n 1)"
+      body="$(printf '%s\n' "$out" | tail -n +2)"
+      printf '%s\n' "$body"
+      if [ "$verdict" = "fail" ]; then
+        lint_fail=1
+      fi
+    done
+    if [ "$lint_fail" -ne 0 ]; then
+      printf 'sumo lint: %s\n' "diagnostics above; fix them and re-run" >&2
+      exit 1
+    fi
+    printf 'All files OK\n'
+    ;;
+  *)
+    echo "sumo: unknown command '$cmd'" >&2
+    echo "Run 'sumo --help' for usage." >&2
+    exit 2
+    ;;
+esac

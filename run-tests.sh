@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Run the full sumo-nix test suite with the local store (same as ./demo/lib.sh).
+# Exits non-zero on the first failure, after printing what failed.
+set -euo pipefail
+cd "$(dirname "$0")"
+source "./tools/env.sh"
+
+tests=(
+  tests/default.nix
+  tests/rules.nix
+  tests/ingest-smoke.nix
+  tests/ingest-report.nix
+  tests/bags.nix
+  tests/decide.nix
+  tests/hf.nix
+  tests/org.nix
+  tests/pyai.nix
+  tests/proof-check.nix
+  tests/unit/equivalents.nix
+  tests/unit/synthesize.nix
+  tests/unit/stratify.nix
+  tests/unit/relax.nix
+  tests/unit/congruence.nix
+  tests/unit/builtins.nix
+  tests/unit/disjunctive.nix
+  tests/unit/soft-rules.nix
+  tests/unit/wfs.nix
+  tests/unit/existentials.nix
+  tests/unit/temporal.nix
+  tests/unit/lift-config.nix
+  tests/unit/drift.nix
+  tests/unit/repair.nix
+  tests/unit/metavisor.nix
+  tests/unit/diag.nix
+  tests/unit/runtime-policy.nix
+)
+
+fail=0
+for t in "${tests[@]}"; do
+  printf '  %-44s ' "$t…"
+  if out="$(./nix-eval.sh --expr "import ./$t" 2>&1)"; then
+    echo "✓"
+  else
+    echo "✗"
+    printf '%s\n' "$out" | sed 's/^/      /'
+    fail=1
+  fi
+done
+
+# Metavisor tick smoke test: observer -> drift -> event log -> status.
+printf '  %-44s ' "metavisor tick…"
+if ./tests/metavisor-smoke.sh > /dev/null 2>&1; then
+  echo "✓"
+else
+  echo "✗"
+  fail=1
+fi
+
+# M0.1 cache: warm hit, byte-diff, poisoned-entry recompute.
+printf '  %-44s ' "cache smoke…"
+if ./tests/cache-smoke.sh > /dev/null 2>&1; then
+  echo "✓"
+else
+  echo "✗"
+  fail=1
+fi
+
+# M0.3 sumo-facts exporter smoke test (stubbed systemctl/ss/nix-store).
+printf '  %-44s ' "sumo-facts exporter…"
+if ./tests/sumo-facts.sh > /dev/null 2>&1; then
+  echo "✓"
+else
+  echo "✗"
+  fail=1
+fi
+
+# Check README generation
+printf '  %-44s ' "README generation…"
+if ./tools/check-readme.sh > /dev/null 2>&1; then
+  echo "✓"
+else
+  echo "✗"
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "✗ suite failed"
+  exit 1
+fi
+echo "✓ all ${#tests[@]} tests passed (+ README check)"

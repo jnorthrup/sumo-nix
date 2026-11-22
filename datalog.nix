@@ -1,40 +1,44 @@
 # Forward chaining over KIF Horn rules, with a proof for every derived fact (nix_sumo.md, sections 5.3, 14, 29).
 #
-#   engine { ontology; rules; facts; } -> { facts, holds, ask, why }
+#   engine { ontology; rules; facts; builtinRegistry ? { }; } -> { facts, holds, ask, why }
 #
 # rules are the top-level (=> antecedent consequent) forms; facts are ground forms. An antecedent may use and,
 # exists, not (negation as failure: keep it out of a cycle), equal, and (instance X Class), which holds for an
 # instance of any subclass of Class by the ontology. A rule whose consequent keeps a variable is refused.
-{ ontology, rules, facts }:
+#
+# Builtins: a set of predicate-name -> { arity: int; eval: bindings -> args -> bool; description: string }.
+# During step, if a premise's head is a builtin, it's evaluated via the builtin's eval function instead of
+# fact lookup. Builtins receive substituted arguments and return true/false.
+{ ontology, rules, facts, builtinRegistry ? { } }:
 let
   inherit (builtins) all any attrNames concatMap concatStringsSep elem elemAt filter foldl' genList head isList isString length mapAttrs substring tail;
 
-  isVar = s: isString s && substring 0 1 s == "?";
-  show = s: if isString s then s else "(" + concatStringsSep " " (map show s) + ")";
+  # Shared KIF helpers
+  kif = import ./lib/kif.nix { };
+  inherit (kif) show showFact headOf isEngineVar ground subst unique getFact getMeta makeEnvelope defaultMeta isEnvelope;
+  isVar = isEngineVar;  # engine only uses ? variables
 
   # Match pattern p against ground f under bindings b: new bindings or null.
   unify = b: p: f:
+    let realFact = getFact f; in
     if isString p then
       if isVar p then
-        if b ? ${p} then (if b.${p} == f then b else null) else b // { ${p} = f; }
-      else if p == f then b else null
-    else if isList f && length p == length f then
-      foldl' (acc: i: if acc == null then null else unify acc (elemAt p i) (elemAt f i)) b (genList (i: i) (length p))
+        if b ? ${p} then (if b.${p} == realFact then b else null) else b // { ${p} = realFact; }
+      else if p == realFact then b else null
+    else if isList realFact && length p == length realFact then
+      foldl' (acc: i: if acc == null then null else unify acc (elemAt p i) (elemAt realFact i)) b (genList (i: i) (length p))
     else null;
-
-  subst = b: s: if isString s then (if isVar s then b.${s} or s else s) else map (subst b) s;
-
-  ground = s: if isString s then !isVar s else all ground s;
-
-  headOf = p: if isList p && p != [ ] then head p else "";
 
   # What a round looks like to a premise: the facts, by relation and by relation with its first argument.
   index = idx:
     let entries = builtins.attrValues idx; in {
       inherit idx entries;
-      byHead = builtins.groupBy (e: headOf e.fact) entries;
-      byFirst = builtins.groupBy (e: headOf e.fact + " " + toString (elemAt e.fact 1)) (filter (e: isList e.fact && length e.fact > 1 && isString (elemAt e.fact 1)) entries);
+      byHead = builtins.groupBy (e: headOf (getFact e.fact)) entries;
+      byFirst = builtins.groupBy (e: headOf (getFact e.fact) + " " + toString (elemAt (getFact e.fact) 1)) (filter (e: isList (getFact e.fact) && length (getFact e.fact) > 1 && isString (elemAt (getFact e.fact) 1)) entries);
     };
+
+  # Check if a predicate name is a builtin
+  isBuiltin = p: builtinRegistry ? ${p};
 
   # The entries that can match premise p under bindings b: the one fact when p is ground, else the narrowest group.
   candidates = ix: b: p:
@@ -46,6 +50,16 @@ let
        else ix.byHead.${h} or [ ])
     else ix.entries;
 
+  # Calculate confidence for derived fact: minimum of all supporting facts
+  calculateConfidence = used: idx:
+    let
+      getConfidence = key:
+        let entry = builtins.getAttr key idx; 
+            meta = if entry.fact ? meta then entry.fact.meta else defaultMeta; in
+        meta.confidence;
+      confidences = map (key: if builtins.hasAttr key idx then getConfidence key else 1.0) used;
+    in if confidences == [ ] then 1.0 else foldl' (a: b: if a < b then a else b) 1.0 confidences;
+
   # Solutions of premise p from state s = { b = bindings; used = keys of the facts it rests on }.
   step = ix: s: p:
     let h = headOf p; in
@@ -54,20 +68,33 @@ let
     else if h == "not" then (if step ix s (elemAt p 1) == [ ] then [ s ] else [ ])
     else if h == "equal" then
       (let a = subst s.b (elemAt p 1); c = subst s.b (elemAt p 2); in if a == c then [ s ] else [ ])
+    else if isBuiltin h then
+      # Builtin predicate: evaluate with substituted arguments
+      (let b = s.b;
+           builtin = builtinRegistry.${h};
+           args = map (a: subst b a) (tail p);
+           result = builtin.eval b args;
+       in if result then [ s ] else [ ])
     else if h == "instance" && ontology != null && length p == 3 && !(isVar (subst s.b (elemAt p 2))) then
       let c = subst s.b (elemAt p 2); in
       concatMap
         (e:
-          let f = e.fact; b = unify s.b (elemAt p 1) (elemAt f 1); in
+          let f = getFact e.fact; b = unify s.b (elemAt p 1) (elemAt f 1); in
           if headOf f == "instance" && length f == 3 && ontology.isSubclass (elemAt f 2) c && b != null
           then [ { inherit b; used = s.used ++ [ e.key ]; } ] else [ ])
         (ix.byHead.instance or [ ])
     else
       concatMap
         (e:
-          let b = unify s.b p e.fact; in
+          let f = getFact e.fact; b = unify s.b p f; in
           if b == null then [ ] else [ { inherit b; used = s.used ++ [ e.key ]; } ])
         (candidates ix s.b p);
+
+  ruleVars = ant: cons: b:
+    let flatten = f: if isList f then concatMap flatten f else [ f ];
+        vs = attrNames b;
+        needed = unique (filter isVar (flatten ant ++ flatten cons));
+    in builtins.listToAttrs (map (v: { name = v; value = b.${v}; }) (filter (v: elem v needed) vs));
 
   # Each rule, with a name from its consequent and its place among the rules.
   named = genList
@@ -78,34 +105,66 @@ let
 
   # Every fact the rules give from idx that idx does not hold yet, with the rule and the facts it rests on.
   # (listToAttrs keeps the first of equal names: the first rule and solution that gave a fact.)
-  derive = idx:
+  derive = round: idx:
     let ix = index idx; in
     builtins.listToAttrs (concatMap
       (r:
+        let cons = r.consequent;
+            isDisjunct = isList cons && headOf cons == "disjunct";
+            disjuncts = if isDisjunct then tail cons else [ cons ];
+        in
         concatMap
-          (s:
-            let f = subst s.b r.consequent; k = show f; in
-            if !(ground f) then throw "rule ${r.id}: the consequent keeps a variable (${k})"
-            else if idx ? ${k} then [ ]
-            else [ { name = k; value = { key = k; fact = f; by = { rule = r.id; from = s.used; }; }; } ])
-          (step ix { b = { }; used = [ ]; } r.antecedent))
+          (disjunctCons:
+            concatMap
+              (s:
+                let f = subst s.b disjunctCons; k = show f; in
+                if !(ground f) then throw "rule ${r.id}: the consequent keeps a variable (${k})"
+                else if idx ? ${k} then [ ]
+                else
+                  let
+                    # Create meta for derived fact (deterministic timestamp for reproducible proofs)
+                    confidence = calculateConfidence s.used idx;
+                    meta = {
+                      sourceClass = "derived";
+                      sourceId = "datalog.nix";
+                      observedAt = 0;
+                      expiresAt = 0;
+                      snapshotId = "";
+                      contentHash = "sha256:" + builtins.hashString "sha256" k;
+                      confidence = confidence;
+                      provenance = s.used;
+                    };
+                    env = makeEnvelope f meta;
+                  in [ { name = k; value = { key = k; fact = env; by = { rule = r.id; from = s.used; round = round; bindings = ruleVars r.antecedent disjunctCons s.b; disjunct = if isDisjunct then headOf disjunctCons else null; }; }; } ])
+              (step ix { b = { }; used = [ ]; } r.antecedent))
+          disjuncts)
       named);
 
-  fix = idx: let new = derive idx; in if new == { } then idx else fix (idx // new);
+  fix = round: idx: let new = derive round idx; in if new == { } then idx else fix (round + 1) (idx // new);
 
-  closure = fix (builtins.listToAttrs (map (f: { name = show f; value = { key = show f; fact = f; by = null; }; }) facts));
+  # Initialize closure with envelopes, but use bare facts for keys
+  initClosure = builtins.listToAttrs (map (f:
+    let env = if isEnvelope f then f else makeEnvelope f null;
+        bareFact = getFact env;
+    in { name = show bareFact; value = { key = show bareFact; fact = env; by = null; }; }
+  ) facts);
+
+  closure = fix 1 initClosure;
 
   proof = k:
-    let e = closure.${k}; in
-    if e.by == null then { fact = show e.fact; asserted = true; }
-    else { fact = show e.fact; rule = e.by.rule; from = map proof e.by.from; };
+    let e = closure.${k}; bare = getFact e.fact; in
+    if e.by == null then { fact = show e.fact; factBare = showFact bare; asserted = true; }
+    else { fact = show e.fact; factBare = showFact bare; rule = e.by.rule; from = map proof e.by.from; };
 
   lines = depth: p:
     let pad = concatStringsSep "" (genList (_: "  ") depth); in
     [ (pad + p.fact + (if p ? asserted then "    asserted" else "    by " + p.rule)) ] ++ concatMap (lines (depth + 1)) (p.from or [ ]);
+
 in
 {
-  facts = map (e: e.fact) (builtins.attrValues closure);
+  facts = map (e: getFact e.fact) (builtins.attrValues closure);
+  envelopes = map (e: e.fact) (builtins.attrValues closure);
+  trace = closure; # full derivation metadata: entry = { key; fact (envelope); by = null | { rule; from; round; bindings } }
   holds = f: closure ? ${show f};
   # The bindings that make a pattern true: ask [ "dependsOnTransitive" "?x" "openssl" ] -> [ { "?x" = "curl"; } .. ]
   ask = pattern: map (s: s.b) (step (index closure) { b = { }; used = [ ]; } pattern);
