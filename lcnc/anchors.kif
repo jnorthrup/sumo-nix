@@ -1,0 +1,110 @@
+;; TrikeShed's LCNC vocabulary anchored in SUMO.
+;;
+;; LCNC blurs the line between work and code.  A program drawn on the canvas is a plan that people and models
+;; carry out, and the same drawing is a computer program that a machine runs; one run of a step is both a
+;; piece of work and a computation.  SUMO keeps Plan and ComputerProgram apart (both are Procedures), and keeps
+;; IntentionalProcess apart from ComputerProcess, so the vocabulary is anchored on both sides at once:
+;;
+;;   (lcncKind KIND HOW CLASS)   what a wire of that kind carries
+;;   (lcncWork TYPE HOW CLASS)   the work a step of that node type is, done by a person or a model
+;;   (lcncCode TYPE HOW CLASS)   the code it is, run by a machine
+;;     exact    CLASS means the same as the kind or type
+;;     broader  CLASS is a SUMO class it falls under: the kind or type is narrower
+;;     new      SUMO has no class for it: CLASS is declared below with (subclass CLASS PARENT)
+;;   (lcncContent KIND CLASS)    the same blur on a wire: a value of KIND is data that holds a CLASS, e.g. a
+;;                               query held as a structured value holds a computer program
+;; (lcncGroup AXIS CLASS): every anchor on AXIS must be CLASS or lie below it.
+;; (lcncUnanchored kind KIND "reason"): left out on purpose.
+;; A node type anchored on one side must be anchored on the other: work without code, or code without work,
+;; is refused.  Kinds come from lcnc/vocabulary.kif, fetched from a running TrikeShed daemon by lcnc/fetch.py.
+;; Most kinds are records on the wire, so they sit under DigitalData; a few are text, names or signals.
+;; Care: SUMO's Table is furniture, so a SQL table is anchored by its name.
+
+(lcncGroup kind ContentBearingPhysical)
+(lcncGroup work IntentionalProcess)
+(lcncGroup code ComputerProgram)
+(lcncGroup content Proposition)
+
+;; The duality itself.
+(subclass LcncProgram Plan)
+(subclass LcncProgram ComputerProgram)
+(documentation LcncProgram EnglishLanguage "A program drawn on an LCNC canvas: a &%Plan that people and models carry out, and the same drawing as a &%ComputerProgram a machine runs.")
+(subclass LcncStep IntentionalProcess)
+(subclass LcncStep ComputerProcess)
+(documentation LcncStep EnglishLanguage "One run of one step of an &%LcncProgram: work an agent does, person or model, and at once a &%ComputerProcess running the program.")
+(=> (instance ?STEP LcncStep)
+    (exists (?PROGRAM)
+      (and (instance ?PROGRAM LcncProgram) (realization ?STEP ?PROGRAM) (programRunning ?STEP ?PROGRAM))))
+
+;; Kinds: what travels on a wire.
+(lcncKind text exact Text)
+(lcncKind json exact DigitalData)
+(lcncKind id broader Identifier)
+(lcncKind num new NumberData)
+(subclass NumberData DigitalData)
+(lcncKind Boolean new TruthValueData)
+(subclass TruthValueData DigitalData)
+(lcncKind trigger broader ContentBearingProcess)
+(lcncKind SqlExpr new SqlExpression)
+(subclass SqlExpression DigitalData)
+(lcncContent SqlExpr ComputerProgram)
+(lcncKind SqlCond new SqlCondition)
+(subclass SqlCondition SqlExpression)
+(lcncContent SqlCond ComputerProgram)
+(lcncKind SqlItem new SqlSelectItem)
+(subclass SqlSelectItem SqlExpression)
+(lcncContent SqlItem ComputerProgram)
+(lcncKind SqlKey broader Identifier)
+(lcncKind SqlTable broader Identifier)
+(lcncKind SqlQuery new SqlQueryValue)
+(subclass SqlQueryValue DigitalData)
+(lcncContent SqlQuery ComputerProgram)
+(lcncKind SparqlPattern new SparqlPatternValue)
+(subclass SparqlPatternValue DigitalData)
+(lcncContent SparqlPattern ComputerProgram)
+(lcncKind SparqlProjection new SparqlProjectionValue)
+(subclass SparqlProjectionValue DigitalData)
+(lcncContent SparqlProjection ComputerProgram)
+(lcncKind SparqlQuery new SparqlQueryValue)
+(subclass SparqlQueryValue DigitalData)
+(lcncContent SparqlQuery ComputerProgram)
+(lcncKind ProjectDoc broader DigitalData)
+(lcncKind DocumentSource broader DigitalData)
+(lcncKind List<ProjectDoc> broader DigitalData)
+(lcncKind List<ProjectRef> broader DigitalData)
+(lcncKind List<TurnFact> broader DigitalData)
+(lcncKind ProposedRules broader DigitalData)
+(lcncContent ProposedRules Proposition)
+(lcncKind ReviewedRules broader DigitalData)
+(lcncContent ReviewedRules Proposition)
+(lcncKind ProposedRelationships broader DigitalData)
+(lcncContent ProposedRelationships Proposition)
+(lcncKind ReviewedRelationships broader DigitalData)
+(lcncContent ReviewedRelationships Proposition)
+(lcncKind ReviewSnapshot broader DigitalData)
+(lcncUnanchored kind Any "the universal port: it names no class and takes every kind")
+(lcncUnanchored kind T "a type variable, bound per node by the checker")
+(lcncUnanchored kind * "a preset's open slot, bound by whatever the preset is given")
+
+;; Node types, both sides.  The steps of a legal review room first.
+(lcncWork council.seat broader Reasoning)
+(lcncCode council.seat new ModelCall)
+(subclass ModelCall ComputerProgram)
+(lcncWork scope broader Meeting)
+(lcncCode scope new ScopedProgram)
+(subclass ScopedProgram ComputerProgram)
+(lcncWork scope.in broader Reading)
+(lcncCode scope.in new ParameterBinding)
+(subclass ParameterBinding ComputerProgram)
+(lcncWork scope.out broader Stating)
+(lcncCode scope.out new ReturnBinding)
+(subclass ReturnBinding ComputerProgram)
+(lcncWork text.value broader Writing)
+(lcncCode text.value new ProgramLiteral)
+(subclass ProgramLiteral ComputerProgram)
+(lcncWork text.fold broader ContentDevelopment)
+(lcncCode text.fold new FoldFunction)
+(subclass FoldFunction ComputerProgram)
+(lcncWork display broader Communication)
+(lcncCode display new DisplayOutput)
+(subclass DisplayOutput ComputerProgram)
