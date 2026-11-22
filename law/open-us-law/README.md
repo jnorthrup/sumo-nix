@@ -30,3 +30,35 @@ jurisdiction, how many corpus texts are byte-identical to a bucket row.
 
 `gen-pins.py` writes `pins.nix` from the bucket listing, the SHA-256 of each downloaded bucket file, the Hub's LFS
 hashes at the pinned revisions, and the chunker's import closure at the pinned commit.
+
+## Results (mlnixos, Nix 2.28.4, nixpkgs 3ff0e34, 2026-11-22, a02214a)
+
+`atoms` passes in all 132 parts. The pinned `StateLawsChunker` cut identical atoms for all 526,818 formalization-ready
+sections. Every published count is recomputed exactly; the manifest's 48 jurisdictions agree row by row:
+
+| | published | recomputed |
+| --- | --- | --- |
+| parent sections read | 537,665 | 537,665 |
+| formalization-ready sections spanned | 526,818 | 526,818 |
+| spans | 685,213 | 685,213 |
+| whole / structure / sentence / hard | 448,330 / 197,725 / 36,617 / 2,541 | the same |
+| NFKC changed | 0 | 0 |
+| jurisdictions | 48 | 48 |
+
+`nix-build --check` rebuilt `format` and `parts.part-000000` with the same bytes.
+
+What the bucket holds (`format`):
+
+| dataset | files | rows | bytes |
+| --- | --- | --- | --- |
+| state and territorial statutes (`us_XX_statutes.parquet`) | 50 | 1,928,555 | 1,041,749,328 |
+| United States Code (`us_federal_statutes.parquet`) | 1 | 54,853 | 88,711,846 |
+| state and territorial constitutions (`us_XX_constitutions.parquet`) | 51 | 7,688 | 3,447,303 |
+| US Constitution (`us_federal_constitutions.parquet`) | 1 | 74 | 31,003 |
+| `legal-corpora-reindex/` evidence from ipfs_datasets_py (LCR-G130, G141, G145, G146) | 7 | | 5,916,927 |
+| README, SHA256SUMS.json, .gitattributes, thumbnail | 4 | | 329,718 |
+
+- The statutes cover 48 states, DC and PR. GA and NC are absent (withdrawn 2026-08-12 for navigation and footer text).
+- The README's coverage table equals the parquet row counts for all 51 rows; its 1,928,555 state sections equal the files.
+- The bucket's own `SHA256SUMS.json` is stale. 102 of its 105 entries match, the two withdrawn files are still listed, and `us_federal_constitutions.parquet` is listed at 25,208 bytes while the file is 31,003 bytes.
+- The bucket is only a seed of the corpus: 94,901 of the corpus's 399,531 distinct texts are byte-identical to a bucket row. They are mostly IL, NH, MS and WI, with a little of KS and TN. In 43 jurisdictions the corpus shares no text with the bucket.
